@@ -73,6 +73,14 @@ internal static class AsyncGHHooks
         TotalComponents <= 0 ? 1f
         : Math.Min(1f, (float)CompletedComponents / TotalComponents);
 
+    /// <summary>
+    /// Serializes <see cref="IGH_ActiveObject.CollectData"/> /
+    /// <see cref="IGH_ActiveObject.ComputeData"/> (writers) against UI redraw /
+    /// paint paths that read volatile structures (readers).
+    /// </summary>
+    internal static readonly ReaderWriterLockSlim SolveLock =
+        new(LockRecursionPolicy.SupportsRecursion);
+
     // ── StructureIterator helpers ────────────────────────────────────────────────
     private static DateTime s_lastDraw = DateTime.MinValue;
 
@@ -181,8 +189,16 @@ internal static class AsyncGHHooks
 
                         RhinoApp.InvokeOnUiThread(() =>
                         {
-                            Instances.RedrawCanvas();
-                            Instances.ActiveRhinoDoc?.Views.Redraw();
+                            SolveLock.EnterReadLock();
+                            try
+                            {
+                                Instances.RedrawCanvas();
+                                Instances.ActiveRhinoDoc?.Views.Redraw();
+                            }
+                            finally
+                            {
+                                SolveLock.ExitReadLock();
+                            }
                         });
                     }
                 });
@@ -210,9 +226,10 @@ internal static class AsyncGHHooks
                 // This happens during initial document load or if NewSolution was called synchronously.
                 bool runSync = Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId;
 
-                // Also run sequentially if this is a nested document (e.g., a cluster)
-                // to avoid ThreadPool starvation from nested Task.WaitAll calls.
-                if (Instances.DocumentServer?.Contains(self) != true)
+                // Nested / cluster sub-documents have an Owner; top-level docs do not.
+                // Do NOT use DocumentServer.Contains — during first file load the doc is
+                // not registered yet, which incorrectly forced sync and froze the UI.
+                if (self.Owner != null)
                     runSync = true;
 
                 // Prevent nested parallelism on the same thread (e.g. recursive solve from a component)
@@ -264,8 +281,16 @@ internal static class AsyncGHHooks
             {
                 RhinoApp.InvokeOnUiThread(() =>
                 {
-                    Instances.RedrawCanvas();
-                    Instances.ActiveRhinoDoc?.Views.Redraw();
+                    SolveLock.EnterReadLock();
+                    try
+                    {
+                        Instances.RedrawCanvas();
+                        Instances.ActiveRhinoDoc?.Views.Redraw();
+                    }
+                    finally
+                    {
+                        SolveLock.ExitReadLock();
+                    }
                 });
             });
     }
