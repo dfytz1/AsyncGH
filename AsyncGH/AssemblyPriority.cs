@@ -21,7 +21,6 @@ public class AsyncGHPriority : GH_AssemblyPriority
         {
             var (ok, fail) = AsyncGHHooks.Install();
 
-            OpenSolveDeferral.Initialize();
             AsyncToolbar.Initialize();
 
             Instances.CanvasCreated += OnCanvasCreated;
