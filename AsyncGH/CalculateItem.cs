@@ -121,7 +121,7 @@ internal class CalculateItem
         {
             if (item.Phase == GH_SolutionPhase.Computed) return;
 
-            AsyncGHHooks.SolveLock.EnterWriteLock();
+            AsyncGHHooks.EnterSolve();
             try
             {
                 item.CollectData();
@@ -129,7 +129,7 @@ internal class CalculateItem
             }
             finally
             {
-                AsyncGHHooks.SolveLock.ExitWriteLock();
+                AsyncGHHooks.ExitSolve();
             }
         }
         catch (Exception ex) when (IsUiThreadError(ex))
@@ -153,7 +153,7 @@ internal class CalculateItem
                 {
                     try
                     {
-                        AsyncGHHooks.SolveLock.EnterWriteLock();
+                        AsyncGHHooks.EnterSolve();
                         try
                         {
                             item.CollectData();
@@ -161,7 +161,7 @@ internal class CalculateItem
                         }
                         finally
                         {
-                            AsyncGHHooks.SolveLock.ExitWriteLock();
+                            AsyncGHHooks.ExitSolve();
                         }
                     }
                     catch (Exception inner)

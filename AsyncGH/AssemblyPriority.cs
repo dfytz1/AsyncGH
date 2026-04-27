@@ -52,27 +52,19 @@ public class AsyncGHPriority : GH_AssemblyPriority
         var g = sender.Graphics;
         if (g == null) return;
 
-        AsyncGHHooks.SolveLock.EnterReadLock();
-        try
-        {
-            var state = g.Save();
-            g.ResetTransform();
+        var state = g.Save();
+        g.ResetTransform();
 
-            var rect = sender.ClientRectangle;
-            rect.Inflate(-4, -4);
+        var rect = sender.ClientRectangle;
+        rect.Inflate(-4, -4);
 
-            float progress = Math.Clamp(AsyncGHHooks.Progress, 0f, 1f);
-            var baseColor = System.Drawing.Color.FromArgb(0, 220, 200);
-            var fillColor = System.Drawing.Color.FromArgb(225, 59, 147);
+        float progress = Math.Clamp(AsyncGHHooks.Progress, 0f, 1f);
+        var baseColor = System.Drawing.Color.FromArgb(0, 220, 200);
+        var fillColor = System.Drawing.Color.FromArgb(225, 59, 147);
 
-            DrawTopProgressBar(g, rect, progress, baseColor, fillColor, barHeight: 6f);
+        DrawTopProgressBar(g, rect, progress, baseColor, fillColor, barHeight: 6f);
 
-            g.Restore(state);
-        }
-        finally
-        {
-            AsyncGHHooks.SolveLock.ExitReadLock();
-        }
+        g.Restore(state);
     }
 
     /// <summary>

@@ -74,12 +74,18 @@ internal static class AsyncGHHooks
         : Math.Min(1f, (float)CompletedComponents / TotalComponents);
 
     /// <summary>
-    /// Serializes <see cref="IGH_ActiveObject.CollectData"/> /
-    /// <see cref="IGH_ActiveObject.ComputeData"/> (writers) against UI redraw /
-    /// paint paths that read volatile structures (readers).
+    /// Depth of active <see cref="IGH_ActiveObject.CollectData"/> /
+    /// <see cref="IGH_ActiveObject.ComputeData"/> calls (re-entrant safe).
+    /// Redraw paths skip work while &gt; 0 to avoid deadlocking with
+    /// synchronous <see cref="RhinoApp.InvokeOnUiThread"/>.
     /// </summary>
-    internal static readonly ReaderWriterLockSlim SolveLock =
-        new(LockRecursionPolicy.SupportsRecursion);
+    private static volatile int s_solveDepth;
+
+    internal static bool IsSolving => s_solveDepth > 0;
+
+    internal static void EnterSolve() => Interlocked.Increment(ref s_solveDepth);
+
+    internal static void ExitSolve() => Interlocked.Decrement(ref s_solveDepth);
 
     // ── StructureIterator helpers ────────────────────────────────────────────────
     private static DateTime s_lastDraw = DateTime.MinValue;
@@ -189,16 +195,8 @@ internal static class AsyncGHHooks
 
                         RhinoApp.InvokeOnUiThread(() =>
                         {
-                            SolveLock.EnterReadLock();
-                            try
-                            {
-                                Instances.RedrawCanvas();
-                                Instances.ActiveRhinoDoc?.Views.Redraw();
-                            }
-                            finally
-                            {
-                                SolveLock.ExitReadLock();
-                            }
+                            Instances.RedrawCanvas();
+                            Instances.ActiveRhinoDoc?.Views.Redraw();
                         });
                     }
                 });
@@ -281,15 +279,12 @@ internal static class AsyncGHHooks
             {
                 RhinoApp.InvokeOnUiThread(() =>
                 {
-                    SolveLock.EnterReadLock();
-                    try
+                    // Non-blocking: if a component is inside Collect/Compute, skip;
+                    // the post-solve redraw or the next PeriodicDraw will catch up.
+                    if (!IsSolving)
                     {
                         Instances.RedrawCanvas();
                         Instances.ActiveRhinoDoc?.Views.Redraw();
-                    }
-                    finally
-                    {
-                        SolveLock.ExitReadLock();
                     }
                 });
             });
