@@ -188,8 +188,16 @@ internal static class AsyncGHHooks
 
                         RhinoApp.InvokeOnUiThread(() =>
                         {
-                            Instances.RedrawCanvas();
-                            Instances.ActiveRhinoDoc?.Views.Redraw();
+                            try
+                            {
+                                if (Instances.ActiveCanvas != null)
+                                    Instances.RedrawCanvas();
+                                Instances.ActiveRhinoDoc?.Views.Redraw();
+                            }
+                            catch
+                            {
+                                // Post-solve redraw during load can still race teardown.
+                            }
                         });
                     }
                 });
@@ -269,36 +277,46 @@ internal static class AsyncGHHooks
         s_redrawAll = new Hook(method,
             (Action orig) =>
             {
-                RhinoApp.InvokeOnUiThread(() =>
+                void redraw()
                 {
-                    Instances.RedrawCanvas();
-
-                    // While components solve on background threads, Rhino's display
-                    // pipeline may enumerate preview data that those threads are
-                    // still mutating — frequent Views.Redraw() causes
-                    // InvalidOperationException ("collection was modified").
-                    // Throttle viewport redraws; GH canvas still updates every call.
-                    bool viewportOk = true;
-                    lock (s_lock)
+                    try
                     {
-                        if (s_running.Count > 0)
+                        if (Instances.ActiveCanvas != null)
+                            Instances.RedrawCanvas();
+
+                        // While components solve on background threads, Rhino's display
+                        // pipeline may enumerate preview data that those threads are
+                        // still mutating — frequent Views.Redraw() causes
+                        // InvalidOperationException ("collection was modified").
+                        bool viewportOk = true;
+                        lock (s_lock)
                         {
-                            var now = DateTime.UtcNow;
-                            if ((now - s_lastViewportRedrawUtc).TotalMilliseconds
-                                < ViewportRedrawMinIntervalMs)
+                            if (s_running.Count > 0)
                             {
-                                viewportOk = false;
-                            }
-                            else
-                            {
-                                s_lastViewportRedrawUtc = now;
+                                var now = DateTime.UtcNow;
+                                if ((now - s_lastViewportRedrawUtc).TotalMilliseconds
+                                    < ViewportRedrawMinIntervalMs)
+                                {
+                                    viewportOk = false;
+                                }
+                                else
+                                    s_lastViewportRedrawUtc = now;
                             }
                         }
-                    }
 
-                    if (viewportOk)
-                        Instances.ActiveRhinoDoc?.Views.Redraw();
-                });
+                        if (viewportOk)
+                            Instances.ActiveRhinoDoc?.Views.Redraw();
+                    }
+                    catch
+                    {
+                        // Swallow — RedrawAll can be triggered during fragile init (e.g. file load).
+                    }
+                }
+
+                if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId)
+                    redraw();
+                else
+                    RhinoApp.InvokeOnUiThread(redraw);
             });
     }
 
@@ -320,9 +338,10 @@ internal static class AsyncGHHooks
         s_iteratorAbort = new Hook(getter,
             (Func<object, bool> orig, object self) =>
             {
-                PeriodicDraw();
+                var iterDoc = s_iterDocField?.GetValue(self) as GH_Document;
+                PeriodicDraw(iterDoc);
 
-                if (s_iterDocField?.GetValue(self) is GH_Document doc && doc.AbortRequested)
+                if (iterDoc != null && iterDoc.AbortRequested)
                     return true;
 
                 return orig(self);
@@ -567,16 +586,44 @@ internal static class AsyncGHHooks
 
     /// <summary>
     /// Called from the structure-iterator hot path during solving.
-    /// Must NOT trigger Rhino viewport redraw — only the Grasshopper canvas
-    /// (progress bar, escape responsiveness). See RedrawAll hook comment.
+    /// Canvas only — never viewport. Skips until <paramref name="doc"/> is on
+    /// <see cref="Instances.DocumentServer"/> so we don't poke the native canvas
+    /// during file load (avoids crashes). Uses same-thread redraw when already
+    /// on the UI thread so we never deadlock <c>InvokeOnUiThread</c>.
     /// </summary>
-    private static void PeriodicDraw()
+    private static void PeriodicDraw(GH_Document? doc)
     {
+        if (doc == null) return;
+
+        if (Instances.DocumentServer?.Contains(doc) != true)
+            return;
+
         var now = DateTime.UtcNow;
         if ((now - s_lastCanvasOnlyDrawUtc).TotalMilliseconds < CanvasOnlyDrawMinIntervalMs)
             return;
         s_lastCanvasOnlyDrawUtc = now;
 
-        RhinoApp.InvokeOnUiThread(() => Instances.RedrawCanvas());
+        SafeRedrawGrasshopperCanvasOnly();
+    }
+
+    private static void SafeRedrawGrasshopperCanvasOnly()
+    {
+        void draw()
+        {
+            try
+            {
+                if (Instances.ActiveCanvas != null)
+                    Instances.RedrawCanvas();
+            }
+            catch
+            {
+                // Ignore — canvas can be half-initialized.
+            }
+        }
+
+        if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId)
+            draw();
+        else
+            RhinoApp.InvokeOnUiThread(draw);
     }
 }
