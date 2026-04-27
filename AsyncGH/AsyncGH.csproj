@@ -1,0 +1,73 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+    <AssemblyName>AsyncGH</AssemblyName>
+    <RootNamespace>AsyncGH</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Optimize>true</Optimize>
+    <!-- GHA is just a renamed DLL -->
+    <AssemblyTitle>AsyncGH</AssemblyTitle>
+  </PropertyGroup>
+
+  <!-- Rhino 8 Mac paths -->
+  <PropertyGroup>
+    <RhinoRoot>/Applications/Rhino 8.app/Contents/Frameworks/RhCore.framework/Versions/A/Resources</RhinoRoot>
+    <GrasshopperRoot>$(RhinoRoot)/ManagedPlugIns/GrasshopperPlugin.rhp</GrasshopperRoot>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="Grasshopper">
+      <HintPath>$(GrasshopperRoot)/Grasshopper.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="GH_IO">
+      <HintPath>$(GrasshopperRoot)/GH_IO.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="RhinoCommon">
+      <HintPath>$(RhinoRoot)/RhinoCommon.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Eto">
+      <HintPath>$(RhinoRoot)/Eto.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Rhino.UI">
+      <HintPath>$(RhinoRoot)/Rhino.UI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="AsyncIcon.png" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Drawing.Common">
+      <HintPath>$(RhinoRoot)/System.Drawing.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="System.Windows.Forms">
+      <HintPath>$(RhinoRoot)/System.Windows.Forms.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- CopyLocalLockFileAssemblies ensures 0Harmony.dll ends up next to the .gha -->
+    <PackageReference Include="MonoMod.RuntimeDetour" Version="25.3.4" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <!-- Copy output as .gha for easy install -->
+  <Target Name="CopyGha" AfterTargets="Build">
+    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll" DestinationFiles="$(OutputPath)$(AssemblyName).gha" />
+  </Target>
+
+</Project>
