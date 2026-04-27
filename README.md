@@ -15,7 +15,7 @@
 | **Clusters** | Cluster sub-documents solve correctly inline |
 | **MessageBox support** | `MessageBox.Show()` is auto-marshalled to the UI thread — no crash |
 | **Rhino input support** | `GetObject`, `GetPoint`, `GetString`, etc. are auto-marshalled to the UI thread |
-| **Teal frame** | A teal border around the canvas indicates an active background solve |
+| **Progress bar** | A teal bar along the top of the canvas fills with magenta as components complete |
 | **Toolbar toggle** | One-click enable/disable via the GH toolbar button |
 
 ---

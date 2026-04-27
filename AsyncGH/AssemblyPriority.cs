@@ -58,64 +58,41 @@ public class AsyncGHPriority : GH_AssemblyPriority
         var rect = sender.ClientRectangle;
         rect.Inflate(-4, -4);
 
-        float progress = AsyncGHHooks.Progress;
-        var color = System.Drawing.Color.FromArgb(0, 220, 200);
+        float progress = Math.Clamp(AsyncGHHooks.Progress, 0f, 1f);
+        var baseColor = System.Drawing.Color.FromArgb(0, 220, 200);
+        var fillColor = System.Drawing.Color.FromArgb(225, 59, 147);
 
-        DrawPerimeterProgress(g, rect, progress, color, thickness: 6f);
+        DrawTopProgressBar(g, rect, progress, baseColor, fillColor, barHeight: 6f);
 
         g.Restore(state);
     }
 
     /// <summary>
-    /// Draws a clockwise-travelling stroke around the rectangle perimeter.
-    /// Progress 0 = nothing drawn; 1 = full border.
-    /// Starts at the top-left corner, travels: right → down → left → up.
+    /// Horizontal bar along the top inset: full-width teal base, magenta fill
+    /// growing left → right with <paramref name="progress"/>.
     /// </summary>
-    private static void DrawPerimeterProgress(
+    private static void DrawTopProgressBar(
         System.Drawing.Graphics g,
         System.Drawing.Rectangle rect,
         float progress,
-        System.Drawing.Color color,
-        float thickness)
+        System.Drawing.Color baseColor,
+        System.Drawing.Color fillColor,
+        float barHeight)
     {
-        if (progress <= 0f) return;
+        if (rect.Width <= 0 || barHeight <= 0) return;
 
-        float w = rect.Width;
-        float h = rect.Height;
-        float total = 2f * (w + h);
-        float remaining = Math.Min(progress, 1f) * total;
+        int h = (int)Math.Ceiling(barHeight);
+        var fullBar = new System.Drawing.Rectangle(rect.Left, rect.Top, rect.Width, h);
 
-        using var pen = new System.Drawing.Pen(color, thickness) { StartCap = System.Drawing.Drawing2D.LineCap.Round, EndCap = System.Drawing.Drawing2D.LineCap.Round };
+        using (var baseBrush = new System.Drawing.SolidBrush(baseColor))
+            g.FillRectangle(baseBrush, fullBar);
 
-        // Top edge: left → right
-        if (remaining > 0)
+        int pinkW = (int)Math.Round(fullBar.Width * progress);
+        if (pinkW > 0)
         {
-            float seg = Math.Min(remaining, w);
-            g.DrawLine(pen, rect.Left, rect.Top, rect.Left + seg, rect.Top);
-            remaining -= seg;
-        }
-
-        // Right edge: top → bottom
-        if (remaining > 0)
-        {
-            float seg = Math.Min(remaining, h);
-            g.DrawLine(pen, rect.Right, rect.Top, rect.Right, rect.Top + seg);
-            remaining -= seg;
-        }
-
-        // Bottom edge: right → left
-        if (remaining > 0)
-        {
-            float seg = Math.Min(remaining, w);
-            g.DrawLine(pen, rect.Right, rect.Bottom, rect.Right - seg, rect.Bottom);
-            remaining -= seg;
-        }
-
-        // Left edge: bottom → top
-        if (remaining > 0)
-        {
-            float seg = Math.Min(remaining, h);
-            g.DrawLine(pen, rect.Left, rect.Bottom, rect.Left, rect.Bottom - seg);
+            pinkW = Math.Min(pinkW, fullBar.Width);
+            using var fillBrush = new System.Drawing.SolidBrush(fillColor);
+            g.FillRectangle(fillBrush, fullBar.Left, fullBar.Top, pinkW, h);
         }
     }
 }

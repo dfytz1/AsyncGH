@@ -1,11 +1,11 @@
 name: AsyncGH
-version: 1.1.0
+version: 1.2.0
 authors:
   - dfytz1
 description: >
   Keep Grasshopper's UI fully responsive while solutions run.
   Supports canvas navigation, component moving, saving, clusters,
-  MessageBox/GetObject components, and shows a teal frame during computation.
+  MessageBox/GetObject components, and shows a top progress bar (teal + magenta) during computation.
 url: https://github.com/dfytz1/AsyncGH
 keywords:
   - async
