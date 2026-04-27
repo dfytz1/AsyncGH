@@ -120,17 +120,8 @@ internal class CalculateItem
         try
         {
             if (item.Phase == GH_SolutionPhase.Computed) return;
-
-            AsyncGHHooks.EnterSolve();
-            try
-            {
-                item.CollectData();
-                item.ComputeData();
-            }
-            finally
-            {
-                AsyncGHHooks.ExitSolve();
-            }
+            item.CollectData();
+            item.ComputeData();
         }
         catch (Exception ex) when (IsUiThreadError(ex))
         {
@@ -153,16 +144,8 @@ internal class CalculateItem
                 {
                     try
                     {
-                        AsyncGHHooks.EnterSolve();
-                        try
-                        {
-                            item.CollectData();
-                            item.ComputeData();
-                        }
-                        finally
-                        {
-                            AsyncGHHooks.ExitSolve();
-                        }
+                        item.CollectData();
+                        item.ComputeData();
                     }
                     catch (Exception inner)
                     {
@@ -175,7 +158,7 @@ internal class CalculateItem
                         item.Attributes?.ExpireLayout();
                     }
                 });
-                return;
+                return; // skip the outer finally (UI thread closure already calls it)
             }
         }
         catch (Exception ex)
@@ -199,26 +182,17 @@ internal class CalculateItem
     /// </summary>
     private static bool IsUiThreadError(Exception ex)
     {
-        // Do not treat data-race / enumerator InvalidOperationExceptions as UI errors.
-        if (ex is InvalidOperationException ioe)
-        {
-            var msg = ioe.Message ?? string.Empty;
-            return msg.Contains("main thread", StringComparison.OrdinalIgnoreCase)
-                || msg.Contains("UI thread", StringComparison.OrdinalIgnoreCase)
-                || msg.Contains("NSAlert", StringComparison.OrdinalIgnoreCase)
-                || msg.Contains("NSApplication", StringComparison.OrdinalIgnoreCase)
-                || msg.Contains("must be called from the main", StringComparison.OrdinalIgnoreCase);
-        }
+        if (ex is InvalidOperationException) return true;
+        if (ex is ThreadStateException)      return true;
 
-        if (ex is ThreadStateException) return true;
-
-        var m = ex.Message ?? string.Empty;
-        return m.Contains("main thread", StringComparison.OrdinalIgnoreCase)
-            || m.Contains("UI thread", StringComparison.OrdinalIgnoreCase)
-            || m.Contains("must be called from the main", StringComparison.OrdinalIgnoreCase)
-            || m.Contains("NSAlert", StringComparison.OrdinalIgnoreCase)
-            || m.Contains("NSApplication", StringComparison.OrdinalIgnoreCase)
-            || (ex.GetType().Name.Contains("ObjC", StringComparison.OrdinalIgnoreCase))
+        // AppKit / macOS ObjC thread-affinity messages
+        var msg = ex.Message ?? string.Empty;
+        return msg.Contains("main thread",    StringComparison.OrdinalIgnoreCase)
+            || msg.Contains("UI thread",      StringComparison.OrdinalIgnoreCase)
+            || msg.Contains("must be called from the main", StringComparison.OrdinalIgnoreCase)
+            || msg.Contains("NSAlert",        StringComparison.OrdinalIgnoreCase)
+            || msg.Contains("NSApplication",  StringComparison.OrdinalIgnoreCase)
+            || (ex.GetType().Name.Contains("ObjC",  StringComparison.OrdinalIgnoreCase))
             || (ex.GetType().Name.Contains("AppKit", StringComparison.OrdinalIgnoreCase));
     }
 }
