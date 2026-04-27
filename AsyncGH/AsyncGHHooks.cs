@@ -26,6 +26,7 @@ internal static class AsyncGHHooks
     private static Hook? s_iteratorAbort;
     private static Hook? s_solutionDepth;
     private static Hook? s_solutionState;
+    private static Hook? s_canSolve;
 
     // MessageBox hooks
     private static Hook? s_msgBox1;
@@ -87,6 +88,17 @@ internal static class AsyncGHHooks
 
     internal static void ExitSolve() => Interlocked.Decrement(ref s_solveDepth);
 
+    /// <summary>
+    /// <see cref="GH_Document.CanSolve"/> touches native OpenNURBS / license strings
+    /// that are not thread-safe. Captured on the UI thread before each async
+    /// <see cref="GH_Document.NewSolution"/> dispatch; returned from the hook on
+    /// worker threads (including cluster sub-documents) to avoid SIGABRT heap corruption.
+    /// </summary>
+    private static volatile bool s_canSolveCache = true;
+
+    /// <summary>Number of in-flight async <c>Task.Run(NewSolution)</c> executions (re-entrant).</summary>
+    private static volatile int s_asyncSolveDepth;
+
     // ── StructureIterator helpers ────────────────────────────────────────────────
     private static DateTime s_lastDraw = DateTime.MinValue;
 
@@ -116,6 +128,7 @@ internal static class AsyncGHHooks
         TryHook("StructureIterator", InstallStructureIterator, ref ok, ref fail);
         TryHook("SolutionDepth",     InstallSolutionDepth,     ref ok, ref fail);
         TryHook("SolutionState",     InstallSolutionState,     ref ok, ref fail);
+        TryHook("CanSolve",          InstallCanSolve,          ref ok, ref fail);
         TryHook("MessageBox",        InstallMessageBox,        ref ok, ref fail);
         TryHook("RhinoInput",        InstallRhinoInputHooks,   ref ok, ref fail);
 
@@ -177,6 +190,10 @@ internal static class AsyncGHHooks
                     s_running.Add(self);
                 }
 
+                // Native license / CanSolve is not thread-safe — snapshot on UI thread only.
+                s_canSolveCache = GetCanSolveUi(self);
+                Interlocked.Increment(ref s_asyncSolveDepth);
+
                 // ── Dispatch to background thread ────────────────────────────────
                 Task.Run(() =>
                 {
@@ -187,6 +204,8 @@ internal static class AsyncGHHooks
                     }
                     finally
                     {
+                        Interlocked.Decrement(ref s_asyncSolveDepth);
+
                         lock (s_lock)
                         {
                             s_calculating.Remove(self);
@@ -367,6 +386,41 @@ internal static class AsyncGHHooks
                 }
                 return state;
             });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // GH_Document.CanSolve getter — avoid native license / ON_wString on worker threads
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    private static void InstallCanSolve()
+    {
+        var getter = typeof(GH_Document)
+            .GetProperty("CanSolve", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            ?.GetGetMethod(nonPublic: true)
+            ?? throw new MissingMemberException("GH_Document.CanSolve getter not found");
+
+        s_canSolve = new Hook(getter,
+            (Func<GH_Document, bool> orig, GH_Document self) =>
+            {
+                if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId)
+                    return orig(self);
+
+                // Cluster sub-docs are not in s_running; s_asyncSolveDepth covers the whole Task.Run(orig).
+                if (Data.UseAsyncSolution
+                    && (IsRunning(self) || Volatile.Read(ref s_asyncSolveDepth) > 0))
+                    return s_canSolveCache;
+
+                return orig(self);
+            });
+    }
+
+    private static bool GetCanSolveUi(GH_Document doc)
+    {
+        var prop = typeof(GH_Document).GetProperty(
+            "CanSolve",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        if (prop?.GetValue(doc) is bool b) return b;
+        return true;
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
