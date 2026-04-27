@@ -73,15 +73,8 @@ internal static class AsyncGHHooks
         TotalComponents <= 0 ? 1f
         : Math.Min(1f, (float)CompletedComponents / TotalComponents);
 
-    // ── StructureIterator / redraw throttling ───────────────────────────────────
-    /// <summary>Last GH-canvas-only refresh (abort / progress UI).</summary>
-    private static DateTime s_lastCanvasOnlyDrawUtc = DateTime.MinValue;
-
-    /// <summary>Last Rhino viewport redraw while an async solve is active.</summary>
-    private static DateTime s_lastViewportRedrawUtc = DateTime.MinValue;
-
-    private const int CanvasOnlyDrawMinIntervalMs   = 50;
-    private const int ViewportRedrawMinIntervalMs = 250;
+    // ── StructureIterator helpers ────────────────────────────────────────────────
+    private static DateTime s_lastDraw = DateTime.MinValue;
 
     private static readonly Type? s_iterType =
         typeof(GH_Component).GetNestedType("GH_StructureIterator",
@@ -188,16 +181,8 @@ internal static class AsyncGHHooks
 
                         RhinoApp.InvokeOnUiThread(() =>
                         {
-                            try
-                            {
-                                if (Instances.ActiveCanvas != null)
-                                    Instances.RedrawCanvas();
-                                Instances.ActiveRhinoDoc?.Views.Redraw();
-                            }
-                            catch
-                            {
-                                // Post-solve redraw during load can still race teardown.
-                            }
+                            Instances.RedrawCanvas();
+                            Instances.ActiveRhinoDoc?.Views.Redraw();
                         });
                     }
                 });
@@ -277,46 +262,11 @@ internal static class AsyncGHHooks
         s_redrawAll = new Hook(method,
             (Action orig) =>
             {
-                void redraw()
+                RhinoApp.InvokeOnUiThread(() =>
                 {
-                    try
-                    {
-                        if (Instances.ActiveCanvas != null)
-                            Instances.RedrawCanvas();
-
-                        // While components solve on background threads, Rhino's display
-                        // pipeline may enumerate preview data that those threads are
-                        // still mutating — frequent Views.Redraw() causes
-                        // InvalidOperationException ("collection was modified").
-                        bool viewportOk = true;
-                        lock (s_lock)
-                        {
-                            if (s_running.Count > 0)
-                            {
-                                var now = DateTime.UtcNow;
-                                if ((now - s_lastViewportRedrawUtc).TotalMilliseconds
-                                    < ViewportRedrawMinIntervalMs)
-                                {
-                                    viewportOk = false;
-                                }
-                                else
-                                    s_lastViewportRedrawUtc = now;
-                            }
-                        }
-
-                        if (viewportOk)
-                            Instances.ActiveRhinoDoc?.Views.Redraw();
-                    }
-                    catch
-                    {
-                        // Swallow — RedrawAll can be triggered during fragile init (e.g. file load).
-                    }
-                }
-
-                if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId)
-                    redraw();
-                else
-                    RhinoApp.InvokeOnUiThread(redraw);
+                    Instances.RedrawCanvas();
+                    Instances.ActiveRhinoDoc?.Views.Redraw();
+                });
             });
     }
 
@@ -338,10 +288,9 @@ internal static class AsyncGHHooks
         s_iteratorAbort = new Hook(getter,
             (Func<object, bool> orig, object self) =>
             {
-                var iterDoc = s_iterDocField?.GetValue(self) as GH_Document;
-                PeriodicDraw(iterDoc);
+                PeriodicDraw();
 
-                if (iterDoc != null && iterDoc.AbortRequested)
+                if (s_iterDocField?.GetValue(self) is GH_Document doc && doc.AbortRequested)
                     return true;
 
                 return orig(self);
@@ -584,46 +533,10 @@ internal static class AsyncGHHooks
     // Helpers
     // ─────────────────────────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Called from the structure-iterator hot path during solving.
-    /// Canvas only — never viewport. Skips until <paramref name="doc"/> is on
-    /// <see cref="Instances.DocumentServer"/> so we don't poke the native canvas
-    /// during file load (avoids crashes). Uses same-thread redraw when already
-    /// on the UI thread so we never deadlock <c>InvokeOnUiThread</c>.
-    /// </summary>
-    private static void PeriodicDraw(GH_Document? doc)
+    private static void PeriodicDraw()
     {
-        if (doc == null) return;
-
-        if (Instances.DocumentServer?.Contains(doc) != true)
-            return;
-
-        var now = DateTime.UtcNow;
-        if ((now - s_lastCanvasOnlyDrawUtc).TotalMilliseconds < CanvasOnlyDrawMinIntervalMs)
-            return;
-        s_lastCanvasOnlyDrawUtc = now;
-
-        SafeRedrawGrasshopperCanvasOnly();
-    }
-
-    private static void SafeRedrawGrasshopperCanvasOnly()
-    {
-        void draw()
-        {
-            try
-            {
-                if (Instances.ActiveCanvas != null)
-                    Instances.RedrawCanvas();
-            }
-            catch
-            {
-                // Ignore — canvas can be half-initialized.
-            }
-        }
-
-        if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId)
-            draw();
-        else
-            RhinoApp.InvokeOnUiThread(draw);
+        if (DateTime.Now - s_lastDraw <= TimeSpan.FromMilliseconds(50)) return;
+        s_lastDraw = DateTime.Now;
+        Instances.RedrawAll();
     }
 }

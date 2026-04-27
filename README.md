@@ -51,6 +51,16 @@ The Grasshopper Libraries folder is usually:
 
 ---
 
+## Faster opening of large definitions
+
+Opening a `.gh` file still spends time **deserializing** thousands of components on the UI thread — AsyncGH cannot remove that work.
+
+What *does* help is **deferring the first solution**: when a new top-level document is added, AsyncGH briefly sets the global Grasshopper flag `GH_Document.EnableSolutions` to `false` (same effect as the solver lock), lets the UI finish layout, then restores your previous solver state and schedules `NewSolution` for each deferred document (only if the solver was already on).
+
+This is controlled by `Data.DeferSolveOnOpen` (default **on**) in source, or you can add a menu toggle later. **Note:** `EnableSolutions` is global — while a file is in this short deferral window, every open Grasshopper document pauses solving (usually only a few hundred milliseconds).
+
+---
+
 ## How it works
 
 AsyncGH uses [MonoMod.RuntimeDetour](https://github.com/MonoMod/MonoMod) to patch Grasshopper's internal methods at runtime:
