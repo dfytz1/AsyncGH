@@ -73,8 +73,15 @@ internal static class AsyncGHHooks
         TotalComponents <= 0 ? 1f
         : Math.Min(1f, (float)CompletedComponents / TotalComponents);
 
-    // ── StructureIterator helpers ────────────────────────────────────────────────
-    private static DateTime s_lastDraw = DateTime.MinValue;
+    // ── StructureIterator / redraw throttling ───────────────────────────────────
+    /// <summary>Last GH-canvas-only refresh (abort / progress UI).</summary>
+    private static DateTime s_lastCanvasOnlyDrawUtc = DateTime.MinValue;
+
+    /// <summary>Last Rhino viewport redraw while an async solve is active.</summary>
+    private static DateTime s_lastViewportRedrawUtc = DateTime.MinValue;
+
+    private const int CanvasOnlyDrawMinIntervalMs   = 50;
+    private const int ViewportRedrawMinIntervalMs = 250;
 
     private static readonly Type? s_iterType =
         typeof(GH_Component).GetNestedType("GH_StructureIterator",
@@ -265,7 +272,32 @@ internal static class AsyncGHHooks
                 RhinoApp.InvokeOnUiThread(() =>
                 {
                     Instances.RedrawCanvas();
-                    Instances.ActiveRhinoDoc?.Views.Redraw();
+
+                    // While components solve on background threads, Rhino's display
+                    // pipeline may enumerate preview data that those threads are
+                    // still mutating — frequent Views.Redraw() causes
+                    // InvalidOperationException ("collection was modified").
+                    // Throttle viewport redraws; GH canvas still updates every call.
+                    bool viewportOk = true;
+                    lock (s_lock)
+                    {
+                        if (s_running.Count > 0)
+                        {
+                            var now = DateTime.UtcNow;
+                            if ((now - s_lastViewportRedrawUtc).TotalMilliseconds
+                                < ViewportRedrawMinIntervalMs)
+                            {
+                                viewportOk = false;
+                            }
+                            else
+                            {
+                                s_lastViewportRedrawUtc = now;
+                            }
+                        }
+                    }
+
+                    if (viewportOk)
+                        Instances.ActiveRhinoDoc?.Views.Redraw();
                 });
             });
     }
@@ -533,10 +565,18 @@ internal static class AsyncGHHooks
     // Helpers
     // ─────────────────────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Called from the structure-iterator hot path during solving.
+    /// Must NOT trigger Rhino viewport redraw — only the Grasshopper canvas
+    /// (progress bar, escape responsiveness). See RedrawAll hook comment.
+    /// </summary>
     private static void PeriodicDraw()
     {
-        if (DateTime.Now - s_lastDraw <= TimeSpan.FromMilliseconds(50)) return;
-        s_lastDraw = DateTime.Now;
-        Instances.RedrawAll();
+        var now = DateTime.UtcNow;
+        if ((now - s_lastCanvasOnlyDrawUtc).TotalMilliseconds < CanvasOnlyDrawMinIntervalMs)
+            return;
+        s_lastCanvasOnlyDrawUtc = now;
+
+        RhinoApp.InvokeOnUiThread(() => Instances.RedrawCanvas());
     }
 }
