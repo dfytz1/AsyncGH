@@ -172,6 +172,7 @@ internal class CalculateItem
         finally
         {
             item.Attributes?.ExpireLayout();
+            AsyncGHHooks.IncrementCompleted();
         }
     }
 

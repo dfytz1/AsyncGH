@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
@@ -54,6 +55,23 @@ internal static class AsyncGHHooks
 
     internal static bool IsRunning(GH_Document doc)
     { lock (s_lock) return s_running.Contains(doc); }
+
+    // ── Progress tracking (written from background threads, read from UI thread) ─
+    internal static int TotalComponents;
+    internal static int CompletedComponents;
+
+    internal static void ResetProgress(int total)
+    {
+        Interlocked.Exchange(ref TotalComponents,    total);
+        Interlocked.Exchange(ref CompletedComponents, 0);
+    }
+
+    internal static void IncrementCompleted()
+        => Interlocked.Increment(ref CompletedComponents);
+
+    internal static float Progress =>
+        TotalComponents <= 0 ? 1f
+        : Math.Min(1f, (float)CompletedComponents / TotalComponents);
 
     // ── StructureIterator helpers ────────────────────────────────────────────────
     private static DateTime s_lastDraw = DateTime.MinValue;
@@ -201,11 +219,21 @@ internal static class AsyncGHHooks
                 if (s_isSolving.Value)
                     runSync = true;
 
+                bool isTopLevel = !s_isSolving.Value;
                 bool wasSolving = s_isSolving.Value;
                 s_isSolving.Value = true;
                 try
                 {
-                    foreach (var batch in CalculateItem.Create(self))
+                    var batches = CalculateItem.Create(self).ToList();
+
+                    // Reset progress counter only for the top-level document solve.
+                    if (isTopLevel)
+                    {
+                        int total = batches.Sum(b => b.Items.Length);
+                        ResetProgress(total);
+                    }
+
+                    foreach (var batch in batches)
                     {
                         if (GH_Document.IsEscapeKeyDown()) self.RequestAbortSolution();
                         if (self.AbortRequested) break;
@@ -507,7 +535,7 @@ internal static class AsyncGHHooks
 
     private static void PeriodicDraw()
     {
-        if (DateTime.Now - s_lastDraw <= TimeSpan.FromMilliseconds(200)) return;
+        if (DateTime.Now - s_lastDraw <= TimeSpan.FromMilliseconds(50)) return;
         s_lastDraw = DateTime.Now;
         Instances.RedrawAll();
     }
