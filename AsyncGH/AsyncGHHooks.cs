@@ -19,11 +19,6 @@ namespace AsyncGH;
 /// </summary>
 internal static class AsyncGHHooks
 {
-    /// <summary>Last time a solve finished for debouncing rapid reschedule loops (GH_RhinoCommon NRE/etc.).</summary>
-    private static readonly Dictionary<GH_Document, DateTime> s_lastSolveTime = new();
-
-    private static readonly TimeSpan SolveCooldown = TimeSpan.FromMilliseconds(50);
-
     // ── Hook objects (must stay alive) ───────────────────────────────────────────
     private static Hook? s_newSolution;
     private static Hook? s_solveAllObjects;
@@ -199,21 +194,22 @@ internal static class AsyncGHHooks
                     if (s_running.Contains(self))
                         return;
 
-                    if (s_lastSolveTime.TryGetValue(self, out var last)
-                        && DateTime.UtcNow - last < SolveCooldown)
-                        return;
-
                     s_running.Add(self);
                 }
 
                 // Sample managed CanSolve on UI only (Rhino 8.30 may have no CLR getter).
-                s_canSolveCache = GetCanSolveUi(self);
-
-                lock (s_lock)
-                    s_calculating.Add(self);
-
+                // Never return after s_running.Add without clearing s_running — use try/finally so
+                // GetCanSolveUi / calculating / orig failures cannot leak s_running.
+                bool ownRun = false;
                 try
                 {
+                    s_canSolveCache = GetCanSolveUi(self);
+
+                    lock (s_lock)
+                        s_calculating.Add(self);
+
+                    ownRun = true;
+
                     // orig stays on UI — SolveAllObjects runs parallel batches internally when allowed.
                     orig(self, expireAll, mode);
                 }
@@ -221,9 +217,13 @@ internal static class AsyncGHHooks
                 {
                     lock (s_lock)
                     {
-                        s_lastSolveTime[self] = DateTime.UtcNow;
-                        s_calculating.Remove(self);
-                        if (Volatile.Read(ref s_asyncSolveDepth) == 0)
+                        if (ownRun)
+                        {
+                            s_calculating.Remove(self);
+                            if (Volatile.Read(ref s_asyncSolveDepth) == 0)
+                                s_running.Remove(self);
+                        }
+                        else
                             s_running.Remove(self);
                     }
                 }
