@@ -175,7 +175,7 @@ internal static class AsyncGHHooks
                 }
 
                 // Snapshot license/solve eligibility on UI thread — background code must not call native CanSolve.
-                s_canSolveCache = SampleCanSolve(self);
+                s_canSolveCache = GetCanSolveUi(self);
 
                 // ── Dispatch to background thread ────────────────────────────────
                 Task.Run(() =>
@@ -317,19 +317,35 @@ internal static class AsyncGHHooks
     // GH_Document.CanSolve getter — avoid native license path on worker threads
     // ─────────────────────────────────────────────────────────────────────────────
 
-    private static MethodInfo? FindCanSolveGetter()
+    private static MethodInfo? _resolvedCanSolveGetter;
+
+    private static bool MatchesCanSolveGetter(string name) =>
+        name == "get_CanSolve"
+        || name.EndsWith(".get_CanSolve", StringComparison.Ordinal)
+        || name.EndsWith("get_CanSolve", StringComparison.Ordinal);
+
+    /// <summary>
+    /// Rhino 8.x may expose eligibility as getters named <c>get_CanSolve</c>
+    /// without any CLR property <c>CanSolve</c> on <see cref="GH_Document"/>.
+    /// Scan instance methods plus explicit interface targets.
+    /// </summary>
+    private static MethodInfo? ResolveCanSolveGetter()
     {
+        if (_resolvedCanSolveGetter != null)
+            return _resolvedCanSolveGetter;
+
         var t = typeof(GH_Document);
 
-        var getter = t.GetProperty(
-                "CanSolve",
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-            ?.GetGetMethod(nonPublic: true);
+        foreach (var m in t.GetMethods(
+                     BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+        {
+            if (!MatchesCanSolveGetter(m.Name)) continue;
+            if (m.GetParameters().Length != 0 || m.ReturnType != typeof(bool)) continue;
 
-        if (getter != null)
-            return getter;
+            _resolvedCanSolveGetter = m;
+            return _resolvedCanSolveGetter;
+        }
 
-        // Explicit interface implementation (e.g. IGH_Document.get_CanSolve)
         foreach (var iface in t.GetInterfaces())
         {
             InterfaceMapping map;
@@ -338,11 +354,13 @@ internal static class AsyncGHHooks
 
             for (var i = 0; i < map.InterfaceMethods.Length; i++)
             {
-                if (map.InterfaceMethods[i].Name.Equals("get_CanSolve", StringComparison.Ordinal)
-                    || map.InterfaceMethods[i].Name.EndsWith("get_CanSolve", StringComparison.Ordinal))
-                {
-                    return map.TargetMethods[i];
-                }
+                if (!MatchesCanSolveGetter(map.InterfaceMethods[i].Name))
+                    continue;
+                var tgt = map.TargetMethods[i];
+                if (tgt.GetParameters().Length != 0 || tgt.ReturnType != typeof(bool)) continue;
+
+                _resolvedCanSolveGetter = tgt;
+                return _resolvedCanSolveGetter;
             }
         }
 
@@ -350,31 +368,28 @@ internal static class AsyncGHHooks
     }
 
     /// <summary>
-    /// Read CanSolve without relying on a public <see cref="GH_Document"/> property
-    /// (only exists as explicit interface implementation on some builds).
+    /// Invoke the same getter we hook (<see cref="MethodInfo.Invoke"/>), UI thread only.
     /// </summary>
-    private static bool SampleCanSolve(GH_Document doc)
+    private static bool GetCanSolveUi(GH_Document doc)
     {
-        foreach (var iface in typeof(GH_Document).GetInterfaces())
+        var m = ResolveCanSolveGetter();
+        if (m == null)
+            return true;
+
+        try
         {
-            var prop = iface.GetProperty(
-                "CanSolve",
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            if (prop?.GetMethod == null) continue;
-            try
-            {
-                if (prop.GetValue(doc, null) is bool b)
-                    return b;
-            }
-            catch { /* next */ }
+            return m.Invoke(doc, null) is bool bl && bl;
         }
-        return true;
+        catch
+        {
+            return true;
+        }
     }
 
     private static void InstallCanSolve()
     {
-        var getter = FindCanSolveGetter()
-            ?? throw new MissingMemberException("GH_Document.CanSolve getter not found");
+        var getter = ResolveCanSolveGetter()
+            ?? throw new MissingMemberException("GH_Document get_CanSolve method not found");
 
         s_canSolve = new Hook(getter,
             (Func<GH_Document, bool> orig, GH_Document self) =>
