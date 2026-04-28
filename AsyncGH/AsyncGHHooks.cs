@@ -19,6 +19,11 @@ namespace AsyncGH;
 /// </summary>
 internal static class AsyncGHHooks
 {
+    /// <summary>Last time a solve finished for debouncing rapid reschedule loops (GH_RhinoCommon NRE/etc.).</summary>
+    private static readonly Dictionary<GH_Document, DateTime> s_lastSolveTime = new();
+
+    private static readonly TimeSpan SolveCooldown = TimeSpan.FromMilliseconds(50);
+
     // ── Hook objects (must stay alive) ───────────────────────────────────────────
     private static Hook? s_newSolution;
     private static Hook? s_solveAllObjects;
@@ -170,7 +175,7 @@ internal static class AsyncGHHooks
             (Action<GH_Document, bool, GH_SolutionMode> orig,
              GH_Document self, bool expireAll, GH_SolutionMode mode) =>
             {
-                // Nested / sub-documents / threads other than UI: run synchronously.
+                // Already on BG thread or nested solve → run sync inline (no Task.Run; avoids native CanSolve).
                 if (Thread.CurrentThread.ManagedThreadId != AsyncGHPriority.UiThreadId || s_isSolving.Value)
                 {
                     orig(self, expireAll, mode);
@@ -194,38 +199,34 @@ internal static class AsyncGHHooks
                     if (s_running.Contains(self))
                         return;
 
+                    if (s_lastSolveTime.TryGetValue(self, out var last)
+                        && DateTime.UtcNow - last < SolveCooldown)
+                        return;
+
                     s_running.Add(self);
-                    s_calculating.Add(self);
                 }
 
-                // Only when a managed get_CanSolve exists (Rhino 8.30 may have none).
+                // Sample managed CanSolve on UI only (Rhino 8.30 may have no CLR getter).
                 s_canSolveCache = GetCanSolveUi(self);
 
-                // Fire-and-forget: orig (and SolveAllObjects) run on a pool thread so
-                // runSync can be false for parallel batches. Cleanup when orig returns.
-                Task.Run(() =>
-                {
-                    Interlocked.Increment(ref s_asyncSolveDepth);
-                    try
-                    {
-                        orig(self, expireAll, mode);
-                    }
-                    finally
-                    {
-                        Interlocked.Decrement(ref s_asyncSolveDepth);
-                        lock (s_lock)
-                        {
-                            s_calculating.Remove(self);
-                            s_running.Remove(self);
-                        }
+                lock (s_lock)
+                    s_calculating.Add(self);
 
-                        RhinoApp.InvokeOnUiThread(() =>
-                        {
-                            Instances.RedrawCanvas();
-                            Instances.ActiveRhinoDoc?.Views.Redraw();
-                        });
+                try
+                {
+                    // orig stays on UI — SolveAllObjects runs parallel batches internally when allowed.
+                    orig(self, expireAll, mode);
+                }
+                finally
+                {
+                    lock (s_lock)
+                    {
+                        s_lastSolveTime[self] = DateTime.UtcNow;
+                        s_calculating.Remove(self);
+                        if (Volatile.Read(ref s_asyncSolveDepth) == 0)
+                            s_running.Remove(self);
                     }
-                });
+                }
             });
     }
 
@@ -246,13 +247,11 @@ internal static class AsyncGHHooks
             {
                 if (!Data.UseAsyncSolution) { orig(self, mode); return; }
 
-                // Nested / cluster docs: always sync inline. UI top-level: runSync = true
-                // (parallel comes from NewSolution's Task.Run). BG top-level: runSync = false.
-                bool onUiThread = Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId;
+                // Cluster / nested: sequential. Top-level main document: parallel batches (including on UI).
                 bool isCluster = self.Owner != null;
                 bool alreadyInSolve = s_isSolving.Value;
 
-                bool runSync = onUiThread || isCluster || alreadyInSolve;
+                bool runSync = isCluster || alreadyInSolve;
 
                 bool isTopLevel = !alreadyInSolve;
                 bool wasSolving = alreadyInSolve;
