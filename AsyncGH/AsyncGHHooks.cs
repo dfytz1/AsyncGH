@@ -192,38 +192,26 @@ internal static class AsyncGHHooks
                     }
 
                     if (s_running.Contains(self))
+                    {
+                        orig(self, expireAll, mode);
                         return;
+                    }
 
                     s_running.Add(self);
+                    s_calculating.Add(self);
                 }
 
-                // Sample managed CanSolve on UI only (Rhino 8.30 may have no CLR getter).
-                // Never return after s_running.Add without clearing s_running — use try/finally so
-                // GetCanSolveUi / calculating / orig failures cannot leak s_running.
-                bool ownRun = false;
                 try
                 {
                     s_canSolveCache = GetCanSolveUi(self);
-
-                    lock (s_lock)
-                        s_calculating.Add(self);
-
-                    ownRun = true;
-
-                    // orig stays on UI — SolveAllObjects runs parallel batches internally when allowed.
                     orig(self, expireAll, mode);
                 }
                 finally
                 {
                     lock (s_lock)
                     {
-                        if (ownRun)
-                        {
-                            s_calculating.Remove(self);
-                            if (Volatile.Read(ref s_asyncSolveDepth) == 0)
-                                s_running.Remove(self);
-                        }
-                        else
+                        s_calculating.Remove(self);
+                        if (Volatile.Read(ref s_asyncSolveDepth) == 0)
                             s_running.Remove(self);
                     }
                 }
