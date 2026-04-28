@@ -26,6 +26,16 @@ internal static class AsyncGHHooks
     private static Hook? s_iteratorAbort;
     private static Hook? s_solutionDepth;
     private static Hook? s_solutionState;
+    private static Hook? s_canSolve;
+
+    /// <summary>
+    /// Last <see cref="GH_Document.CanSolve"/> sampled on the UI thread before async solve.
+    /// Read from background threads when the real getter would touch native license code.
+    /// </summary>
+    private static bool s_canSolveCache = true;
+
+    /// <summary>Nested async solve depth (Task.Run workers). Used with <see cref="IsRunning"/>.</summary>
+    private static int s_asyncSolveDepth;
 
     // MessageBox hooks
     private static Hook? s_msgBox1;
@@ -102,6 +112,7 @@ internal static class AsyncGHHooks
         TryHook("StructureIterator", InstallStructureIterator, ref ok, ref fail);
         TryHook("SolutionDepth",     InstallSolutionDepth,     ref ok, ref fail);
         TryHook("SolutionState",     InstallSolutionState,     ref ok, ref fail);
+        TryHook("CanSolve",          InstallCanSolve,          ref ok, ref fail);
         TryHook("MessageBox",        InstallMessageBox,        ref ok, ref fail);
         TryHook("RhinoInput",        InstallRhinoInputHooks,   ref ok, ref fail);
 
@@ -163,9 +174,13 @@ internal static class AsyncGHHooks
                     s_running.Add(self);
                 }
 
+                // Snapshot license/solve eligibility on UI thread — background code must not call native CanSolve.
+                s_canSolveCache = SampleCanSolve(self);
+
                 // ── Dispatch to background thread ────────────────────────────────
                 Task.Run(() =>
                 {
+                    Interlocked.Increment(ref s_asyncSolveDepth);
                     try
                     {
                         lock (s_lock) s_calculating.Add(self);
@@ -173,6 +188,7 @@ internal static class AsyncGHHooks
                     }
                     finally
                     {
+                        Interlocked.Decrement(ref s_asyncSolveDepth);
                         lock (s_lock)
                         {
                             s_calculating.Remove(self);
@@ -292,6 +308,83 @@ internal static class AsyncGHHooks
 
                 if (s_iterDocField?.GetValue(self) is GH_Document doc && doc.AbortRequested)
                     return true;
+
+                return orig(self);
+            });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // GH_Document.CanSolve getter — avoid native license path on worker threads
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    private static MethodInfo? FindCanSolveGetter()
+    {
+        var t = typeof(GH_Document);
+
+        var getter = t.GetProperty(
+                "CanSolve",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            ?.GetGetMethod(nonPublic: true);
+
+        if (getter != null)
+            return getter;
+
+        // Explicit interface implementation (e.g. IGH_Document.get_CanSolve)
+        foreach (var iface in t.GetInterfaces())
+        {
+            InterfaceMapping map;
+            try { map = t.GetInterfaceMap(iface); }
+            catch { continue; }
+
+            for (var i = 0; i < map.InterfaceMethods.Length; i++)
+            {
+                if (map.InterfaceMethods[i].Name.Equals("get_CanSolve", StringComparison.Ordinal)
+                    || map.InterfaceMethods[i].Name.EndsWith("get_CanSolve", StringComparison.Ordinal))
+                {
+                    return map.TargetMethods[i];
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Read CanSolve without relying on a public <see cref="GH_Document"/> property
+    /// (only exists as explicit interface implementation on some builds).
+    /// </summary>
+    private static bool SampleCanSolve(GH_Document doc)
+    {
+        foreach (var iface in typeof(GH_Document).GetInterfaces())
+        {
+            var prop = iface.GetProperty(
+                "CanSolve",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (prop?.GetMethod == null) continue;
+            try
+            {
+                if (prop.GetValue(doc, null) is bool b)
+                    return b;
+            }
+            catch { /* next */ }
+        }
+        return true;
+    }
+
+    private static void InstallCanSolve()
+    {
+        var getter = FindCanSolveGetter()
+            ?? throw new MissingMemberException("GH_Document.CanSolve getter not found");
+
+        s_canSolve = new Hook(getter,
+            (Func<GH_Document, bool> orig, GH_Document self) =>
+            {
+                if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId)
+                    return orig(self);
+
+                if (Data.UseAsyncSolution
+                    && (IsRunning(self) || Volatile.Read(ref s_asyncSolveDepth) > 0))
+                    return s_canSolveCache;
 
                 return orig(self);
             });
