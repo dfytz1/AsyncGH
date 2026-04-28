@@ -293,11 +293,11 @@ internal static class AsyncGHHooks
         s_redrawAll = new Hook(method,
             (Action orig) =>
             {
-                RhinoApp.InvokeOnUiThread(() =>
-                {
-                    Instances.RedrawCanvas();
-                    Instances.ActiveRhinoDoc?.Views.Redraw();
-                });
+                // During nested async/worker solves, suppress GH's redraw storm — PeriodicDraw handles canvas.
+                if (Data.UseAsyncSolution && Volatile.Read(ref s_asyncSolveDepth) > 0)
+                    return;
+
+                orig();
             });
     }
 
@@ -656,8 +656,14 @@ internal static class AsyncGHHooks
 
     private static void PeriodicDraw()
     {
-        if (DateTime.Now - s_lastDraw <= TimeSpan.FromMilliseconds(50)) return;
+        if (DateTime.Now - s_lastDraw <= TimeSpan.FromMilliseconds(100)) return;
         s_lastDraw = DateTime.Now;
-        Instances.RedrawAll();
+
+        // Fire-and-forget UI post — never call Instances.RedrawAll() here (re-enters InstallRedrawAll).
+        RhinoApp.InvokeOnUiThread((Action)(() =>
+        {
+            try { Instances.RedrawCanvas(); }
+            catch { /* canvas may not exist yet */ }
+        }));
     }
 }
