@@ -19,9 +19,6 @@ namespace AsyncGH;
 /// </summary>
 internal static class AsyncGHHooks
 {
-    /// <summary>Set by <see cref="InstallSolveAllObjects"/> when a background worker owns <see cref="s_running"/>.</summary>
-    private static GH_Document? s_docPendingAsyncSolve;
-
     // ── Hook objects (must stay alive) ───────────────────────────────────────────
     private static Hook? s_newSolution;
     private static Hook? s_solveAllObjects;
@@ -204,21 +201,31 @@ internal static class AsyncGHHooks
                 // Only when a managed get_CanSolve exists (Rhino 8.30 may have none).
                 s_canSolveCache = GetCanSolveUi(self);
 
-                try
+                // Fire-and-forget: orig (and SolveAllObjects) run on a pool thread so
+                // runSync can be false for parallel batches. Cleanup when orig returns.
+                Task.Run(() =>
                 {
-                    // Native license / CanSolve runs on UI — never move orig to Task.Run.
-                    orig(self, expireAll, mode);
-                }
-                finally
-                {
-                    lock (s_lock)
+                    Interlocked.Increment(ref s_asyncSolveDepth);
+                    try
                     {
-                        s_calculating.Remove(self);
-                        // If SolveAllObjects dispatched a worker, it clears s_running + sentinel.
-                        if (s_docPendingAsyncSolve != self)
-                            s_running.Remove(self);
+                        orig(self, expireAll, mode);
                     }
-                }
+                    finally
+                    {
+                        Interlocked.Decrement(ref s_asyncSolveDepth);
+                        lock (s_lock)
+                        {
+                            s_calculating.Remove(self);
+                            s_running.Remove(self);
+                        }
+
+                        RhinoApp.InvokeOnUiThread(() =>
+                        {
+                            Instances.RedrawCanvas();
+                            Instances.ActiveRhinoDoc?.Views.Redraw();
+                        });
+                    }
+                });
             });
     }
 
@@ -239,81 +246,36 @@ internal static class AsyncGHHooks
             {
                 if (!Data.UseAsyncSolution) { orig(self, mode); return; }
 
-                // If we are on the UI thread, we MUST run sequentially to avoid deadlocks.
-                // Also run sequentially for nested/cluster docs to avoid ThreadPool starvation
-                // from nested Task.WaitAll calls.
-                bool runSync = Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId;
+                // Nested / cluster docs: always sync inline. UI top-level: runSync = true
+                // (parallel comes from NewSolution's Task.Run). BG top-level: runSync = false.
+                bool onUiThread = Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId;
+                bool isCluster = self.Owner != null;
+                bool alreadyInSolve = s_isSolving.Value;
 
-                if (Instances.DocumentServer?.Contains(self) != true)
-                    runSync = true;
+                bool runSync = onUiThread || isCluster || alreadyInSolve;
 
-                if (s_isSolving.Value)
-                    runSync = true;
+                bool isTopLevel = !alreadyInSolve;
+                bool wasSolving = alreadyInSolve;
+                s_isSolving.Value = true;
 
-                var wasSolvingEntry = s_isSolving.Value;
-                var isTopLevelSolve = !wasSolvingEntry;
-
-                void RunBatches(bool syncFlag, bool resetProgressIfTopLevel)
+                try
                 {
                     var batches = CalculateItem.Create(self).ToList();
 
-                    if (resetProgressIfTopLevel)
-                    {
-                        int total = batches.Sum(b => b.Items.Length);
-                        ResetProgress(total);
-                    }
+                    if (isTopLevel)
+                        ResetProgress(batches.Sum(b => b.Items.Length));
 
                     foreach (var batch in batches)
                     {
                         if (GH_Document.IsEscapeKeyDown()) self.RequestAbortSolution();
                         if (self.AbortRequested) break;
-                        batch.Solve(mode, syncFlag);
+                        batch.Solve(mode, runSync);
                     }
                 }
-
-                if (runSync)
+                finally
                 {
-                    s_isSolving.Value = true;
-                    try
-                    {
-                        RunBatches(syncFlag: true, resetProgressIfTopLevel: isTopLevelSolve);
-                    }
-                    finally
-                    {
-                        s_isSolving.Value = wasSolvingEntry;
-                    }
-                    return;
+                    s_isSolving.Value = wasSolving;
                 }
-
-                // Parallel path: Solve() expects a worker thread when runSync is false — keep
-                // NewSolution/orig on UI, offload batch loop here (UI blocks until .Wait completes).
-                Interlocked.Increment(ref s_asyncSolveDepth);
-                lock (s_lock)
-                    s_docPendingAsyncSolve = self;
-
-                Task.Run(() =>
-                {
-                    s_isSolving.Value = true;
-                    try
-                    {
-                        RunBatches(syncFlag: false, resetProgressIfTopLevel: isTopLevelSolve);
-                    }
-                    finally
-                    {
-                        s_isSolving.Value = wasSolvingEntry;
-                        Interlocked.Decrement(ref s_asyncSolveDepth);
-                        lock (s_lock)
-                        {
-                            s_docPendingAsyncSolve = null;
-                            s_running.Remove(self);
-                        }
-                        RhinoApp.InvokeOnUiThread(() =>
-                        {
-                            Instances.RedrawCanvas();
-                            Instances.ActiveRhinoDoc?.Views.Redraw();
-                        });
-                    }
-                }).Wait();
                 // Do NOT call orig — our loop replaces it entirely.
             });
     }
