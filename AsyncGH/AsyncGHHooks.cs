@@ -26,16 +26,6 @@ internal static class AsyncGHHooks
     private static Hook? s_iteratorAbort;
     private static Hook? s_solutionDepth;
     private static Hook? s_solutionState;
-    private static Hook? s_canSolve;
-
-    /// <summary>
-    /// Last <see cref="GH_Document.CanSolve"/> sampled on the UI thread before async solve.
-    /// Read from background threads when the real getter would touch native license code.
-    /// </summary>
-    private static bool s_canSolveCache = true;
-
-    /// <summary>Nested async solve depth (Task.Run workers). Used with <see cref="IsRunning"/>.</summary>
-    private static int s_asyncSolveDepth;
 
     // MessageBox hooks
     private static Hook? s_msgBox1;
@@ -112,7 +102,6 @@ internal static class AsyncGHHooks
         TryHook("StructureIterator", InstallStructureIterator, ref ok, ref fail);
         TryHook("SolutionDepth",     InstallSolutionDepth,     ref ok, ref fail);
         TryHook("SolutionState",     InstallSolutionState,     ref ok, ref fail);
-        TryHookCanSolve(ref ok, ref fail);
         TryHook("MessageBox",        InstallMessageBox,        ref ok, ref fail);
         TryHook("RhinoInput",        InstallRhinoInputHooks,   ref ok, ref fail);
 
@@ -127,28 +116,6 @@ internal static class AsyncGHHooks
             fail++;
             RhinoApp.WriteLine(
                 $"[AsyncGH] Hook '{name}' skipped: {ex.GetType().Name}: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// CanSolve getter may not exist as managed CLR (Rhino 8.30+) — hook only when we find one.
-    /// </summary>
-    private static void TryHookCanSolve(ref int ok, ref int fail)
-    {
-        var getter = ResolveCanSolveGetter();
-        if (getter == null)
-            return;
-
-        try
-        {
-            InstallCanSolve(getter);
-            ok++;
-        }
-        catch (Exception ex)
-        {
-            fail++;
-            RhinoApp.WriteLine(
-                $"[AsyncGH] Hook 'CanSolve' skipped: {ex.GetType().Name}: {ex.Message}");
         }
     }
 
@@ -170,51 +137,55 @@ internal static class AsyncGHHooks
             (Action<GH_Document, bool, GH_SolutionMode> orig,
              GH_Document self, bool expireAll, GH_SolutionMode mode) =>
             {
-                // Already on BG thread or nested solve → run sync inline (no Task.Run; avoids native CanSolve).
+                // ── Already on a background thread OR inside an active solve ──
+                // Covers: clusters, sub-documents, any nested solve inside a
+                // component's ComputeData. Run synchronously so the caller gets
+                // a completed result before it returns.
                 if (Thread.CurrentThread.ManagedThreadId != AsyncGHPriority.UiThreadId || s_isSolving.Value)
                 {
                     orig(self, expireAll, mode);
                     return;
                 }
 
-                if (!Data.UseAsyncSolution)
-                {
-                    orig(self, expireAll, mode);
-                    return;
-                }
+                // ── Synchronous fallback ─────────────────────────────────────────
+                if (!Data.UseAsyncSolution) { orig(self, expireAll, mode); return; }
 
                 lock (s_lock)
                 {
-                    if (s_calculating.Contains(self))
-                    {
-                        orig(self, expireAll, mode);
-                        return;
-                    }
+                    // Re-entrant call from inside an ongoing background solve → inline.
+                    if (s_calculating.Contains(self)) { orig(self, expireAll, mode); return; }
 
-                    if (s_running.Contains(self))
-                    {
-                        orig(self, expireAll, mode);
-                        return;
-                    }
+                    // A background solve is already queued for this document.
+                    // Drop this duplicate request; GH will reschedule if needed
+                    // once the current solve finishes and it still sees expired objects.
+                    if (s_running.Contains(self)) return;
 
                     s_running.Add(self);
-                    s_calculating.Add(self);
                 }
 
-                try
+                // ── Dispatch to background thread ────────────────────────────────
+                Task.Run(() =>
                 {
-                    s_canSolveCache = GetCanSolveUi(self);
-                    orig(self, expireAll, mode);
-                }
-                finally
-                {
-                    lock (s_lock)
+                    try
                     {
-                        s_calculating.Remove(self);
-                        if (Volatile.Read(ref s_asyncSolveDepth) == 0)
-                            s_running.Remove(self);
+                        lock (s_lock) s_calculating.Add(self);
+                        orig(self, expireAll, mode);
                     }
-                }
+                    finally
+                    {
+                        lock (s_lock)
+                        {
+                            s_calculating.Remove(self);
+                            s_running.Remove(self);
+                        }
+
+                        RhinoApp.InvokeOnUiThread(() =>
+                        {
+                            Instances.RedrawCanvas();
+                            Instances.ActiveRhinoDoc?.Views.Redraw();
+                        });
+                    }
+                });
             });
     }
 
@@ -235,22 +206,32 @@ internal static class AsyncGHHooks
             {
                 if (!Data.UseAsyncSolution) { orig(self, mode); return; }
 
-                // Cluster / nested: sequential. Top-level main document: parallel batches (including on UI).
-                bool isCluster = self.Owner != null;
-                bool alreadyInSolve = s_isSolving.Value;
+                // If we are on the UI thread, we MUST run sequentially to avoid deadlocks.
+                // This happens during initial document load or if NewSolution was called synchronously.
+                bool runSync = Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId;
 
-                bool runSync = isCluster || alreadyInSolve;
+                // Also run sequentially if this is a nested document (e.g., a cluster)
+                // to avoid ThreadPool starvation from nested Task.WaitAll calls.
+                if (Instances.DocumentServer?.Contains(self) != true)
+                    runSync = true;
 
-                bool isTopLevel = !alreadyInSolve;
-                bool wasSolving = alreadyInSolve;
+                // Prevent nested parallelism on the same thread (e.g. recursive solve from a component)
+                if (s_isSolving.Value)
+                    runSync = true;
+
+                bool isTopLevel = !s_isSolving.Value;
+                bool wasSolving = s_isSolving.Value;
                 s_isSolving.Value = true;
-
                 try
                 {
                     var batches = CalculateItem.Create(self).ToList();
 
+                    // Reset progress counter only for the top-level document solve.
                     if (isTopLevel)
-                        ResetProgress(batches.Sum(b => b.Items.Length));
+                    {
+                        int total = batches.Sum(b => b.Items.Length);
+                        ResetProgress(total);
+                    }
 
                     foreach (var batch in batches)
                     {
@@ -281,11 +262,11 @@ internal static class AsyncGHHooks
         s_redrawAll = new Hook(method,
             (Action orig) =>
             {
-                // During nested async/worker solves, suppress GH's redraw storm — PeriodicDraw handles canvas.
-                if (Data.UseAsyncSolution && Volatile.Read(ref s_asyncSolveDepth) > 0)
-                    return;
-
-                orig();
+                RhinoApp.InvokeOnUiThread(() =>
+                {
+                    Instances.RedrawCanvas();
+                    Instances.ActiveRhinoDoc?.Views.Redraw();
+                });
             });
     }
 
@@ -314,96 +295,6 @@ internal static class AsyncGHHooks
 
                 return orig(self);
             });
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────────
-    // GH_Document.CanSolve getter — avoid native license path on worker threads
-    // ─────────────────────────────────────────────────────────────────────────────
-
-    private static MethodInfo? _resolvedCanSolveGetter;
-
-    private static bool MatchesCanSolveGetter(string name) =>
-        name == "get_CanSolve"
-        || name.EndsWith(".get_CanSolve", StringComparison.Ordinal)
-        || name.EndsWith("get_CanSolve", StringComparison.Ordinal);
-
-    /// <summary>
-    /// Rhino 8.x may expose eligibility as getters named <c>get_CanSolve</c>
-    /// without any CLR property <c>CanSolve</c> on <see cref="GH_Document"/>.
-    /// Scan instance methods plus explicit interface targets.
-    /// </summary>
-    private static MethodInfo? ResolveCanSolveGetter()
-    {
-        if (_resolvedCanSolveGetter != null)
-            return _resolvedCanSolveGetter;
-
-        var t = typeof(GH_Document);
-
-        foreach (var m in t.GetMethods(
-                     BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
-        {
-            if (!MatchesCanSolveGetter(m.Name)) continue;
-            if (m.GetParameters().Length != 0 || m.ReturnType != typeof(bool)) continue;
-
-            _resolvedCanSolveGetter = m;
-            return _resolvedCanSolveGetter;
-        }
-
-        foreach (var iface in t.GetInterfaces())
-        {
-            InterfaceMapping map;
-            try { map = t.GetInterfaceMap(iface); }
-            catch { continue; }
-
-            for (var i = 0; i < map.InterfaceMethods.Length; i++)
-            {
-                if (!MatchesCanSolveGetter(map.InterfaceMethods[i].Name))
-                    continue;
-                var tgt = map.TargetMethods[i];
-                if (tgt.GetParameters().Length != 0 || tgt.ReturnType != typeof(bool)) continue;
-
-                _resolvedCanSolveGetter = tgt;
-                return _resolvedCanSolveGetter;
-            }
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// Invoke the same getter we hook (<see cref="MethodInfo.Invoke"/>), UI thread only.
-    /// </summary>
-    private static bool GetCanSolveUi(GH_Document doc)
-    {
-        var m = ResolveCanSolveGetter();
-        if (m == null)
-            return true;
-
-        try
-        {
-            return m.Invoke(doc, null) is bool bl && bl;
-        }
-        catch
-        {
-            return true;
-        }
-    }
-
-    private static void InstallCanSolve(MethodInfo getter)
-    {
-        s_canSolve = new Hook(getter, CanSolveReplacement);
-    }
-
-    private static bool CanSolveReplacement(Func<GH_Document, bool> orig, GH_Document self)
-    {
-        if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId)
-            return orig(self);
-
-        if (Data.UseAsyncSolution
-            && (IsRunning(self) || Volatile.Read(ref s_asyncSolveDepth) > 0))
-            return s_canSolveCache;
-
-        return orig(self);
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -644,14 +535,8 @@ internal static class AsyncGHHooks
 
     private static void PeriodicDraw()
     {
-        if (DateTime.Now - s_lastDraw <= TimeSpan.FromMilliseconds(100)) return;
+        if (DateTime.Now - s_lastDraw <= TimeSpan.FromMilliseconds(50)) return;
         s_lastDraw = DateTime.Now;
-
-        // Fire-and-forget UI post — never call Instances.RedrawAll() here (re-enters InstallRedrawAll).
-        RhinoApp.InvokeOnUiThread((Action)(() =>
-        {
-            try { Instances.RedrawCanvas(); }
-            catch { /* canvas may not exist yet */ }
-        }));
+        Instances.RedrawAll();
     }
 }
