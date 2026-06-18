@@ -163,14 +163,14 @@ internal static class AsyncGHHooks
 
                 lock (s_lock)
                 {
-                    // Re-entrant call from inside an ongoing background solve → inline.
-                    if (s_calculating.Contains(self)) { orig(self, expireAll, mode); return; }
-
-                    // A background solve is already in flight for this document.
-                    // Don't start a second one (that would race), but remember the
-                    // request so it runs as soon as the current solve finishes —
-                    // otherwise edits made mid-solve would be silently lost.
-                    if (s_running.Contains(self))
+                    // We are guaranteed to be on the UI thread here (the guard above
+                    // returns for every background/nested call). So any solve already
+                    // in flight for this document means the user edited the canvas
+                    // mid-solve (deleted a component, rewired, etc.). Do NOT run it
+                    // synchronously — that would freeze the UI. Instead remember the
+                    // latest request and re-dispatch it when the current solve ends,
+                    // so edits are never lost and the UI stays responsive.
+                    if (s_running.Contains(self) || s_calculating.Contains(self))
                     {
                         var prev = s_pending.TryGetValue(self, out var p) ? p : default;
                         s_pending[self] = (expireAll || prev.expireAll, mode);
