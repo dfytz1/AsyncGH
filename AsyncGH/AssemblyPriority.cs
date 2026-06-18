@@ -12,13 +12,22 @@ namespace AsyncGH;
 /// </summary>
 public class AsyncGHPriority : GH_AssemblyPriority
 {
-    /// <summary>UI thread managed ID captured at load time.</summary>
-    internal static readonly int UiThreadId = Thread.CurrentThread.ManagedThreadId;
+    /// <summary>
+    /// UI thread managed ID. Captured explicitly in <see cref="PriorityLoad"/>,
+    /// which Grasshopper invokes on the main UI thread during startup. Every
+    /// thread-affinity decision in the plugin compares against this value, so it
+    /// must reflect the genuine UI thread.
+    /// </summary>
+    internal static int UiThreadId { get; private set; } = Thread.CurrentThread.ManagedThreadId;
 
     public override GH_LoadingInstruction PriorityLoad()
     {
         try
         {
+            // Re-capture here to be certain we record the real UI thread, even if
+            // this type was first touched on some other thread.
+            UiThreadId = Thread.CurrentThread.ManagedThreadId;
+
             var (ok, fail) = AsyncGHHooks.Install();
 
             AsyncToolbar.Initialize();

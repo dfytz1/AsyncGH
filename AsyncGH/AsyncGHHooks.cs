@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -53,6 +54,13 @@ internal static class AsyncGHHooks
     /// <summary>Documents whose orig(NewSolution) is executing on a BG thread (re-entrance guard).</summary>
     private  static readonly HashSet<GH_Document> s_calculating  = new();
 
+    /// <summary>
+    /// Latest solution request that arrived while a background solve was already
+    /// running for a document. Re-dispatched once the running solve finishes so
+    /// edits made during a solve are never silently dropped.
+    /// </summary>
+    private  static readonly Dictionary<GH_Document, (bool expireAll, GH_SolutionMode mode)> s_pending = new();
+
     internal static bool IsRunning(GH_Document doc)
     { lock (s_lock) return s_running.Contains(doc); }
 
@@ -74,7 +82,10 @@ internal static class AsyncGHHooks
         : Math.Min(1f, (float)CompletedComponents / TotalComponents);
 
     // ── StructureIterator helpers ────────────────────────────────────────────────
-    private static DateTime s_lastDraw = DateTime.MinValue;
+    // Stored as ticks and accessed via Interlocked: the AbortSolution getter is
+    // invoked from many background threads concurrently, so a plain DateTime
+    // field could tear or throttle incorrectly.
+    private static long s_lastDrawTicks;
 
     private static readonly Type? s_iterType =
         typeof(GH_Component).GetNestedType("GH_StructureIterator",
@@ -155,10 +166,16 @@ internal static class AsyncGHHooks
                     // Re-entrant call from inside an ongoing background solve → inline.
                     if (s_calculating.Contains(self)) { orig(self, expireAll, mode); return; }
 
-                    // A background solve is already queued for this document.
-                    // Drop this duplicate request; GH will reschedule if needed
-                    // once the current solve finishes and it still sees expired objects.
-                    if (s_running.Contains(self)) return;
+                    // A background solve is already in flight for this document.
+                    // Don't start a second one (that would race), but remember the
+                    // request so it runs as soon as the current solve finishes —
+                    // otherwise edits made mid-solve would be silently lost.
+                    if (s_running.Contains(self))
+                    {
+                        var prev = s_pending.TryGetValue(self, out var p) ? p : default;
+                        s_pending[self] = (expireAll || prev.expireAll, mode);
+                        return;
+                    }
 
                     s_running.Add(self);
                 }
@@ -166,6 +183,10 @@ internal static class AsyncGHHooks
                 // ── Dispatch to background thread ────────────────────────────────
                 Task.Run(() =>
                 {
+                    bool             rerun     = false;
+                    bool             reExpire  = false;
+                    GH_SolutionMode  reMode    = mode;
+
                     try
                     {
                         lock (s_lock) s_calculating.Add(self);
@@ -177,12 +198,25 @@ internal static class AsyncGHHooks
                         {
                             s_calculating.Remove(self);
                             s_running.Remove(self);
+
+                            if (s_pending.TryGetValue(self, out var p))
+                            {
+                                s_pending.Remove(self);
+                                rerun    = true;
+                                reExpire = p.expireAll;
+                                reMode   = p.mode;
+                            }
                         }
 
                         RhinoApp.InvokeOnUiThread(() =>
                         {
                             Instances.RedrawCanvas();
                             Instances.ActiveRhinoDoc?.Views.Redraw();
+
+                            // Re-run on the UI thread so it flows back through this
+                            // same hook and dispatches a fresh background solve.
+                            if (rerun)
+                                self.NewSolution(reExpire, reMode);
                         });
                     }
                 });
@@ -206,9 +240,16 @@ internal static class AsyncGHHooks
             {
                 if (!Data.UseAsyncSolution) { orig(self, mode); return; }
 
+                // Default: solve sequentially on the current (background) thread.
+                // The UI stays responsive because the whole solve is already off
+                // the UI thread; we avoid the data races that come from touching
+                // the non-thread-safe GH/Rhino object model from several threads.
+                bool runSync = !Data.UseParallel;
+
                 // If we are on the UI thread, we MUST run sequentially to avoid deadlocks.
                 // This happens during initial document load or if NewSolution was called synchronously.
-                bool runSync = Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId;
+                if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId)
+                    runSync = true;
 
                 // Also run sequentially if this is a nested document (e.g., a cluster)
                 // to avoid ThreadPool starvation from nested Task.WaitAll calls.
@@ -360,42 +401,22 @@ internal static class AsyncGHHooks
         var m1 = t.GetMethod("Show", BindingFlags.Static | BindingFlags.Public, null, new[] { typeof(string) }, null);
         if (m1 != null)
             s_msgBox1 = new Hook(m1, (Func<string, DialogResult> orig, string text) =>
-            {
-                if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId) return orig(text);
-                DialogResult res = DialogResult.None;
-                RhinoApp.InvokeOnUiThread((Action)(() => res = orig(text)));
-                return res;
-            });
+                RunOnUiSync(() => orig(text)));
 
         var m2 = t.GetMethod("Show", BindingFlags.Static | BindingFlags.Public, null, new[] { typeof(string), typeof(string) }, null);
         if (m2 != null)
             s_msgBox2 = new Hook(m2, (Func<string, string, DialogResult> orig, string text, string caption) =>
-            {
-                if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId) return orig(text, caption);
-                DialogResult res = DialogResult.None;
-                RhinoApp.InvokeOnUiThread((Action)(() => res = orig(text, caption)));
-                return res;
-            });
+                RunOnUiSync(() => orig(text, caption)));
 
         var m3 = t.GetMethod("Show", BindingFlags.Static | BindingFlags.Public, null, new[] { typeof(string), typeof(string), typeof(MessageBoxButtons) }, null);
         if (m3 != null)
             s_msgBox3 = new Hook(m3, (Func<string, string, MessageBoxButtons, DialogResult> orig, string text, string caption, MessageBoxButtons buttons) =>
-            {
-                if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId) return orig(text, caption, buttons);
-                DialogResult res = DialogResult.None;
-                RhinoApp.InvokeOnUiThread((Action)(() => res = orig(text, caption, buttons)));
-                return res;
-            });
+                RunOnUiSync(() => orig(text, caption, buttons)));
 
         var m4 = t.GetMethod("Show", BindingFlags.Static | BindingFlags.Public, null, new[] { typeof(string), typeof(string), typeof(MessageBoxButtons), typeof(MessageBoxIcon) }, null);
         if (m4 != null)
             s_msgBox4 = new Hook(m4, (Func<string, string, MessageBoxButtons, MessageBoxIcon, DialogResult> orig, string text, string caption, MessageBoxButtons buttons, MessageBoxIcon icon) =>
-            {
-                if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId) return orig(text, caption, buttons, icon);
-                DialogResult res = DialogResult.None;
-                RhinoApp.InvokeOnUiThread((Action)(() => res = orig(text, caption, buttons, icon)));
-                return res;
-            });
+                RunOnUiSync(() => orig(text, caption, buttons, icon)));
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -418,13 +439,7 @@ internal static class AsyncGHHooks
             s_getObjectMultiple = new Hook(mGetMultiple,
                 (Func<GetObject, int, int, GetResult> orig,
                  GetObject self, int min, int max) =>
-                {
-                    if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId)
-                        return orig(self, min, max);
-                    GetResult res = GetResult.Cancel;
-                    RhinoApp.InvokeOnUiThread((Action)(() => res = orig(self, min, max)));
-                    return res;
-                });
+                    RunOnUiSync(() => orig(self, min, max)));
 
         // ── GetObject.Get() ──────────────────────────────────────────────────────
         var mGetSingle = typeof(GetObject).GetMethod(
@@ -435,13 +450,7 @@ internal static class AsyncGHHooks
         if (mGetSingle != null)
             s_getObjectSingle = new Hook(mGetSingle,
                 (Func<GetObject, GetResult> orig, GetObject self) =>
-                {
-                    if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId)
-                        return orig(self);
-                    GetResult res = GetResult.Cancel;
-                    RhinoApp.InvokeOnUiThread((Action)(() => res = orig(self)));
-                    return res;
-                });
+                    RunOnUiSync(() => orig(self)));
 
         // ── GetPoint.Get() ───────────────────────────────────────────────────────
         var mGetPoint = typeof(GetPoint).GetMethod(
@@ -452,13 +461,7 @@ internal static class AsyncGHHooks
         if (mGetPoint != null)
             s_getPointGet = new Hook(mGetPoint,
                 (Func<GetPoint, GetResult> orig, GetPoint self) =>
-                {
-                    if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId)
-                        return orig(self);
-                    GetResult res = GetResult.Cancel;
-                    RhinoApp.InvokeOnUiThread((Action)(() => res = orig(self)));
-                    return res;
-                });
+                    RunOnUiSync(() => orig(self)));
 
         // ── GetPoint.Get(bool) ───────────────────────────────────────────────────
         var mGetPointBool = typeof(GetPoint).GetMethod(
@@ -469,13 +472,7 @@ internal static class AsyncGHHooks
         if (mGetPointBool != null)
             s_getPointGet2 = new Hook(mGetPointBool,
                 (Func<GetPoint, bool, GetResult> orig, GetPoint self, bool onMouseUp) =>
-                {
-                    if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId)
-                        return orig(self, onMouseUp);
-                    GetResult res = GetResult.Cancel;
-                    RhinoApp.InvokeOnUiThread((Action)(() => res = orig(self, onMouseUp)));
-                    return res;
-                });
+                    RunOnUiSync(() => orig(self, onMouseUp)));
 
         // ── GetString.Get() ──────────────────────────────────────────────────────
         var mGetString = typeof(GetString).GetMethod(
@@ -486,13 +483,7 @@ internal static class AsyncGHHooks
         if (mGetString != null)
             s_getStringGet = new Hook(mGetString,
                 (Func<GetString, GetResult> orig, GetString self) =>
-                {
-                    if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId)
-                        return orig(self);
-                    GetResult res = GetResult.Cancel;
-                    RhinoApp.InvokeOnUiThread((Action)(() => res = orig(self)));
-                    return res;
-                });
+                    RunOnUiSync(() => orig(self)));
 
         // ── GetInteger.Get() ─────────────────────────────────────────────────────
         var mGetInt = typeof(GetInteger).GetMethod(
@@ -503,13 +494,7 @@ internal static class AsyncGHHooks
         if (mGetInt != null)
             s_getIntegerGet = new Hook(mGetInt,
                 (Func<GetInteger, GetResult> orig, GetInteger self) =>
-                {
-                    if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId)
-                        return orig(self);
-                    GetResult res = GetResult.Cancel;
-                    RhinoApp.InvokeOnUiThread((Action)(() => res = orig(self)));
-                    return res;
-                });
+                    RunOnUiSync(() => orig(self)));
 
         // ── GetNumber.Get() ──────────────────────────────────────────────────────
         var mGetNumber = typeof(GetNumber).GetMethod(
@@ -520,13 +505,7 @@ internal static class AsyncGHHooks
         if (mGetNumber != null)
             s_getNumberGet = new Hook(mGetNumber,
                 (Func<GetNumber, GetResult> orig, GetNumber self) =>
-                {
-                    if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId)
-                        return orig(self);
-                    GetResult res = GetResult.Cancel;
-                    RhinoApp.InvokeOnUiThread((Action)(() => res = orig(self)));
-                    return res;
-                });
+                    RunOnUiSync(() => orig(self)));
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -535,8 +514,53 @@ internal static class AsyncGHHooks
 
     private static void PeriodicDraw()
     {
-        if (DateTime.Now - s_lastDraw <= TimeSpan.FromMilliseconds(50)) return;
-        s_lastDraw = DateTime.Now;
+        long now  = DateTime.UtcNow.Ticks;
+        long last = Interlocked.Read(ref s_lastDrawTicks);
+        if (now - last <= TimeSpan.FromMilliseconds(50).Ticks) return;
+
+        // Only one thread wins the throttle window; the rest bail out.
+        if (Interlocked.CompareExchange(ref s_lastDrawTicks, now, last) != last) return;
+
         Instances.RedrawAll();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Synchronous UI-thread marshalling.
+    //
+    // RhinoApp.InvokeOnUiThread only *posts* a delegate to the UI message loop; it
+    // does not reliably block or return a value. The interactive-input / MessageBox
+    // hooks need the calling background thread to wait for the result, otherwise the
+    // thread races ahead with a bogus value while a modal dialog runs on the UI
+    // thread — a frequent source of crashes. These helpers block until the UI thread
+    // has finished and propagate the result (and any exception).
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    internal static void RunOnUiSync(Action action)
+    {
+        if (Thread.CurrentThread.ManagedThreadId == AsyncGHPriority.UiThreadId)
+        {
+            action();
+            return;
+        }
+
+        using var done = new ManualResetEventSlim(false);
+        ExceptionDispatchInfo? captured = null;
+
+        RhinoApp.InvokeOnUiThread((Action)(() =>
+        {
+            try { action(); }
+            catch (Exception ex) { captured = ExceptionDispatchInfo.Capture(ex); }
+            finally { done.Set(); }
+        }));
+
+        done.Wait();
+        captured?.Throw();
+    }
+
+    internal static T RunOnUiSync<T>(Func<T> func)
+    {
+        T result = default!;
+        RunOnUiSync(() => { result = func(); });
+        return result;
     }
 }

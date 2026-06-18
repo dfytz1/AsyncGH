@@ -93,7 +93,7 @@ internal class CalculateItem
             return;
         }
 
-        var uiItems = Items.Where(i => Data.NoAsyncObjects.Contains(i.ComponentGuid)).ToArray();
+        var uiItems = Items.Where(i => Data.IsNoAsync(i.ComponentGuid)).ToArray();
         var bgItems = Items.Except(uiItems).ToArray();
 
         // Start background tasks, but don't wait yet.
@@ -120,45 +120,29 @@ internal class CalculateItem
         try
         {
             if (item.Phase == GH_SolutionPhase.Computed) return;
-            item.CollectData();
-            item.ComputeData();
-        }
-        catch (Exception ex) when (IsUiThreadError(ex))
-        {
-            // Component tried to touch UI/AppKit from a background thread.
-            // Register it as UI-only so future solves route it to the main thread.
-            if (!Data.NoAsyncObjects.Contains(item.ComponentGuid))
-            {
-                Data.NoAsyncObjects.Add(item.ComponentGuid);
-                RhinoApp.WriteLine(
-                    $"[AsyncGH] '{item.Name}' requires the UI thread — " +
-                    "will be re-routed on the next solve. " +
-                    $"({ex.GetType().Name}: {ex.Message})");
-            }
 
-            // Re-run immediately on the UI thread so this solve cycle still
-            // produces output (the component won't show an error bubble).
-            if (Thread.CurrentThread.ManagedThreadId != AsyncGHPriority.UiThreadId)
+            try
             {
-                RhinoApp.InvokeOnUiThread(() =>
+                item.CollectData();
+                item.ComputeData();
+            }
+            catch (Exception ex) when (IsUiThreadError(ex))
+            {
+                // Component tried to touch UI/AppKit from a background thread.
+                // Register it as UI-only so future solves route it to the main thread.
+                if (Data.MarkNoAsync(item.ComponentGuid))
+                    RhinoApp.WriteLine(
+                        $"[AsyncGH] '{item.Name}' requires the UI thread — " +
+                        "will be re-routed on the next solve. " +
+                        $"({ex.GetType().Name}: {ex.Message})");
+
+                // Re-run on the UI thread (blocking until it finishes) so this solve
+                // cycle still produces output before downstream components run.
+                AsyncGHHooks.RunOnUiSync(() =>
                 {
-                    try
-                    {
-                        item.CollectData();
-                        item.ComputeData();
-                    }
-                    catch (Exception inner)
-                    {
-                        item.Phase = GH_SolutionPhase.Failed;
-                        item.AddRuntimeMessage(GH_RuntimeMessageLevel.Error,
-                            $"UI-thread retry failed: {inner.Message}");
-                    }
-                    finally
-                    {
-                        item.Attributes?.ExpireLayout();
-                    }
+                    item.CollectData();
+                    item.ComputeData();
                 });
-                return; // skip the outer finally (UI thread closure already calls it)
             }
         }
         catch (Exception ex)
