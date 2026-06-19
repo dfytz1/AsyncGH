@@ -131,7 +131,10 @@ internal static class AsyncToolbar
             {
                 if (_toolbarRegistered) return;
                 if (TryAddToolbarButton())
+                {
                     _toolbarRegistered = true;
+                    WatchEditorForClose(editor);
+                }
             }
             finally
             {
@@ -154,6 +157,24 @@ internal static class AsyncToolbar
         {
             Register();
         }
+    }
+
+    /// <summary>
+    /// Reset registration state when the Grasshopper editor window closes, so the toolbar button
+    /// is re-added if the editor is reopened (a fresh editor/toolbar is created each time, which
+    /// would otherwise be skipped because of the one-shot <see cref="_toolbarRegistered"/> latch).
+    /// </summary>
+    private static void WatchEditorForClose(Form editor)
+    {
+        FormClosedEventHandler? closed = null;
+        closed = (_, _) =>
+        {
+            editor.FormClosed -= closed;
+            _toolbarRegistered      = false;
+            _toolbarRegisterPending = false;
+            _toolButton             = null;
+        };
+        editor.FormClosed += closed;
     }
 
     private static bool TryAddToolbarButton()
